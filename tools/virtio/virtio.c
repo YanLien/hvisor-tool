@@ -45,6 +45,7 @@ int ko_fd;
 static int efd = -1;
 static int sfd = -1;
 static int epoll_fd = -1;
+static bool use_eventfd = true;
 volatile struct virtio_bridge *virtio_bridge;
 
 pthread_mutex_t RES_MUTEX = PTHREAD_MUTEX_INITIALIZER;
@@ -105,13 +106,16 @@ int get_zone_ram_index(void *zonex_ipa, int zone_id) {
     return -1;
 }
 
-inline int is_queue_full(unsigned int front, unsigned int rear,
-                         unsigned int size) {
+int is_queue_full(unsigned int front, unsigned int rear, unsigned int size) {
     if (((rear + 1) & (size - 1)) == front) {
         return 1;
     } else {
         return 0;
     }
+}
+
+int is_queue_empty(unsigned int front, unsigned int rear) {
+    return rear == front;
 }
 
 /// Write barrier to make sure all write operations are finished before this
@@ -406,26 +410,38 @@ void virtqueue_enable_notify(VirtQueue *vq) {
 
 void virtqueue_set_desc_table(VirtQueue *vq) {
     int zone_id = vq->dev->zone_id;
-    log_debug("zone %d set dev %s desc table ipa at %#x", zone_id,
-              virtio_device_type_to_string(vq->dev->type), vq->desc_table_addr);
+    log_debug("zone %d set dev %s queue %lu desc ipa=%#lx", zone_id,
+              virtio_device_type_to_string(vq->dev->type), vq->vq_idx,
+              vq->desc_table_addr);
     vq->desc_table = (VirtqDesc *)get_virt_addr(
         (void *)(uintptr_t)vq->desc_table_addr, zone_id);
+    log_debug("zone %d dev %s queue %lu desc hva=%p", zone_id,
+              virtio_device_type_to_string(vq->dev->type), vq->vq_idx,
+              vq->desc_table);
 }
 
 void virtqueue_set_avail(VirtQueue *vq) {
     int zone_id = vq->dev->zone_id;
-    log_debug("zone %d set dev %s avail ring ipa at %#x", zone_id,
-              virtio_device_type_to_string(vq->dev->type), vq->avail_addr);
+    log_debug("zone %d set dev %s queue %lu avail ipa=%#lx", zone_id,
+              virtio_device_type_to_string(vq->dev->type), vq->vq_idx,
+              vq->avail_addr);
     vq->avail_ring =
         (VirtqAvail *)get_virt_addr((void *)(uintptr_t)vq->avail_addr, zone_id);
+    log_debug("zone %d dev %s queue %lu avail hva=%p", zone_id,
+              virtio_device_type_to_string(vq->dev->type), vq->vq_idx,
+              vq->avail_ring);
 }
 
 void virtqueue_set_used(VirtQueue *vq) {
     int zone_id = vq->dev->zone_id;
-    log_debug("zone %d set dev %s used ring ipa at %#x", zone_id,
-              virtio_device_type_to_string(vq->dev->type), vq->used_addr);
+    log_debug("zone %d set dev %s queue %lu used ipa=%#lx", zone_id,
+              virtio_device_type_to_string(vq->dev->type), vq->vq_idx,
+              vq->used_addr);
     vq->used_ring =
         (VirtqUsed *)get_virt_addr((void *)(uintptr_t)vq->used_addr, zone_id);
+    log_debug("zone %d dev %s queue %lu used hva=%p", zone_id,
+              virtio_device_type_to_string(vq->dev->type), vq->vq_idx,
+              vq->used_ring);
 }
 
 // record one descriptor to iov.
@@ -554,9 +570,9 @@ void update_used_ring(VirtQueue *vq, uint16_t idx, uint32_t iolen) {
     used_ring->idx = used_idx;
     write_barrier();
     // pthread_mutex_unlock(&vq->used_ring_lock);
-    log_debug(
-        "update used ring: used_idx is %d, elem->idx is %d, vq->num is %d",
-        used_idx, idx, vq->num);
+    log_debug("update used ring: dev=%s queue=%lu used_idx=%u elem_idx=%u len=%u num=%lu used=%p",
+              virtio_device_type_to_string(vq->dev->type), vq->vq_idx,
+              used_idx, idx, iolen, vq->num, used_ring);
 }
 
 // function for translating virtio offset to meaning string
@@ -622,10 +638,9 @@ static const char *virtio_mmio_reg_name(uint64_t offset) {
 }
 
 uint64_t virtio_mmio_read(VirtIODevice *vdev, uint64_t offset, unsigned size) {
-    log_debug("READ virtio mmio at offset=%#x[%s], size=%d, vdev=%p, type=%d",
-              offset, virtio_mmio_reg_name(offset), size, vdev, vdev->type);
-
     if (!vdev) {
+        log_warn("READ virtio mmio with no matched device, offset=%#x[%s], size=%d",
+                 offset, virtio_mmio_reg_name(offset), size);
         switch (offset) {
         case VIRTIO_MMIO_MAGIC_VALUE:
             log_debug("read VIRTIO_MMIO_MAGIC_VALUE");
@@ -641,11 +656,22 @@ uint64_t virtio_mmio_read(VirtIODevice *vdev, uint64_t offset, unsigned size) {
         }
     }
 
+    log_debug("READ virtio mmio at offset=%#x[%s], size=%d, vdev=%p, type=%d",
+              offset, virtio_mmio_reg_name(offset), size, vdev, vdev->type);
+
     if (offset >= VIRTIO_MMIO_CONFIG) {
+        uint64_t value = 0;
         offset -= VIRTIO_MMIO_CONFIG;
-        // the first member of vdev->dev must be config.
-        log_debug("read virtio dev config");
-        return *(uint64_t *)(vdev->dev + offset);
+        if (size != 1 && size != 2 && size != 4 && size != 8) {
+            log_error("virtio-mmio-read: invalid config access size %u", size);
+            return 0;
+        }
+        // Config space fields are not guaranteed to be naturally aligned for a
+        // host-sized load. Asterinas reads virtio-console rows at offset 2.
+        memcpy(&value, (uint8_t *)vdev->dev + offset, size);
+        log_debug("read virtio dev config: dev=%s offset=%#lx size=%u value=%#lx",
+                  virtio_device_type_to_string(vdev->type), offset, size, value);
+        return value;
     }
 
     if (size != 4) {
@@ -661,24 +687,39 @@ uint64_t virtio_mmio_read(VirtIODevice *vdev, uint64_t offset, unsigned size) {
         log_debug("read VIRTIO_MMIO_VERSION");
         return VIRT_VERSION;
     case VIRTIO_MMIO_DEVICE_ID:
-        log_debug("read VIRTIO_MMIO_DEVICE_ID");
+        log_debug("read VIRTIO_MMIO_DEVICE_ID: %u", vdev->regs.device_id);
         return vdev->regs.device_id;
     case VIRTIO_MMIO_VENDOR_ID:
         log_debug("read VIRTIO_MMIO_VENDOR_ID");
         return VIRT_VENDOR;
     case VIRTIO_MMIO_DEVICE_FEATURES:
-        log_debug("read VIRTIO_MMIO_DEVICE_FEATURES");
-
         if (vdev->regs.dev_feature_sel) {
+            log_debug("read VIRTIO_MMIO_DEVICE_FEATURES high: %#lx",
+                      vdev->regs.dev_feature >> 32);
             return vdev->regs.dev_feature >> 32;
         } else {
+            log_debug("read VIRTIO_MMIO_DEVICE_FEATURES low: %#lx",
+                      vdev->regs.dev_feature & UINT32_MAX);
             return vdev->regs.dev_feature;
         }
     case VIRTIO_MMIO_QUEUE_NUM_MAX:
-        log_debug("read VIRTIO_MMIO_QUEUE_NUM_MAX");
+        if (vdev->regs.queue_sel >= vdev->vqs_len) {
+            log_debug("read VIRTIO_MMIO_QUEUE_NUM_MAX queue %u: 0",
+                      vdev->regs.queue_sel);
+            return 0;
+        }
+        log_debug("read VIRTIO_MMIO_QUEUE_NUM_MAX queue %u: %u",
+                  vdev->regs.queue_sel,
+                  vdev->vqs[vdev->regs.queue_sel].queue_num_max);
         return vdev->vqs[vdev->regs.queue_sel].queue_num_max;
     case VIRTIO_MMIO_QUEUE_READY:
-        log_debug("read VIRTIO_MMIO_QUEUE_READY");
+        if (vdev->regs.queue_sel >= vdev->vqs_len) {
+            log_debug("read VIRTIO_MMIO_QUEUE_READY queue %u: 0",
+                      vdev->regs.queue_sel);
+            return 0;
+        }
+        log_debug("read VIRTIO_MMIO_QUEUE_READY queue %u: %u",
+                  vdev->regs.queue_sel, vdev->vqs[vdev->regs.queue_sel].ready);
         return vdev->vqs[vdev->regs.queue_sel].ready;
     case VIRTIO_MMIO_INTERRUPT_STATUS:
         log_debug("(%s) current interrupt status is %d", __func__,
@@ -695,7 +736,7 @@ uint64_t virtio_mmio_read(VirtIODevice *vdev, uint64_t offset, unsigned size) {
         }
         return vdev->regs.interrupt_status;
     case VIRTIO_MMIO_STATUS:
-        log_debug("read VIRTIO_MMIO_STATUS");
+        log_debug("read VIRTIO_MMIO_STATUS: %#x", vdev->regs.status);
         return vdev->regs.status;
     case VIRTIO_MMIO_CONFIG_GENERATION:
         log_debug("read VIRTIO_MMIO_CONFIG_GENERATION");
@@ -724,6 +765,12 @@ uint64_t virtio_mmio_read(VirtIODevice *vdev, uint64_t offset, unsigned size) {
 
 void virtio_mmio_write(VirtIODevice *vdev, uint64_t offset, uint64_t value,
                        unsigned size) {
+    if (!vdev) {
+        log_warn("WRITE virtio mmio with no matched device, offset=%#x[%s], value=%#x, size=%d",
+                 offset, virtio_mmio_reg_name(offset), value, size);
+        return;
+    }
+
     log_debug("WRITE virtio mmio at offset=%#x[%s], value=%#x, size=%d, "
               "vdev=%p, type=%d",
               offset, virtio_mmio_reg_name(offset), value, size, vdev,
@@ -731,9 +778,6 @@ void virtio_mmio_write(VirtIODevice *vdev, uint64_t offset, uint64_t value,
 
     VirtMmioRegs *regs = &vdev->regs;
     VirtQueue *vqs = vdev->vqs;
-    if (!vdev) {
-        return;
-    }
 
     if (offset >= VIRTIO_MMIO_CONFIG) {
         offset -= VIRTIO_MMIO_CONFIG;
@@ -747,7 +791,9 @@ void virtio_mmio_write(VirtIODevice *vdev, uint64_t offset, uint64_t value,
 
     switch (offset) {
     case VIRTIO_MMIO_DEVICE_FEATURES_SEL:
-        log_debug("write VIRTIO_MMIO_DEVICE_FEATURES_SEL");
+        log_debug("zone %d driver set device %s features select %lu",
+                  vdev->zone_id, virtio_device_type_to_string(vdev->type),
+                  value);
         if (value) {
             regs->dev_feature_sel = 1;
         } else {
@@ -755,7 +801,7 @@ void virtio_mmio_write(VirtIODevice *vdev, uint64_t offset, uint64_t value,
         }
         break;
     case VIRTIO_MMIO_DRIVER_FEATURES:
-        log_debug("zone %d driver set device %s, accepted features %d",
+        log_debug("zone %d driver set device %s, accepted features %#lx",
                   vdev->zone_id, virtio_device_type_to_string(vdev->type),
                   value);
         if (regs->drv_feature_sel) {
@@ -775,7 +821,9 @@ void virtio_mmio_write(VirtIODevice *vdev, uint64_t offset, uint64_t value,
         }
         break;
     case VIRTIO_MMIO_DRIVER_FEATURES_SEL:
-        log_debug("write VIRTIO_MMIO_DRIVER_FEATURES_SEL");
+        log_debug("zone %d driver set device %s driver features select %lu",
+                  vdev->zone_id, virtio_device_type_to_string(vdev->type),
+                  value);
 
         if (value) {
             regs->drv_feature_sel = 1;
@@ -784,29 +832,41 @@ void virtio_mmio_write(VirtIODevice *vdev, uint64_t offset, uint64_t value,
         }
         break;
     case VIRTIO_MMIO_QUEUE_SEL:
-        log_debug("zone %d driver set device %s, selecting queue %d",
+        log_debug("zone %d driver set device %s, selecting queue %lu",
                   vdev->zone_id, virtio_device_type_to_string(vdev->type),
                   value);
 
-        if (value < vdev->vqs_len) {
-            regs->queue_sel = value;
-        }
+        regs->queue_sel = value;
         break;
     case VIRTIO_MMIO_QUEUE_NUM:
-        log_debug("zone %d driver set device %s, use virtqueue num %d",
+        log_debug("zone %d driver set device %s queue %u num %lu",
                   vdev->zone_id, virtio_device_type_to_string(vdev->type),
-                  value);
+                  regs->queue_sel, value);
 
+        if (regs->queue_sel >= vdev->vqs_len) {
+            log_warn("ignore QUEUE_NUM for invalid queue %d", regs->queue_sel);
+            break;
+        }
         vqs[regs->queue_sel].num = value;
         break;
     case VIRTIO_MMIO_QUEUE_READY:
-        log_debug("write VIRTIO_MMIO_QUEUE_READY");
-
+        if (regs->queue_sel >= vdev->vqs_len) {
+            log_warn("ignore QUEUE_READY for invalid queue %d", regs->queue_sel);
+            break;
+        }
+        log_debug("zone %d driver set device %s queue %u ready %lu",
+                  vdev->zone_id, virtio_device_type_to_string(vdev->type),
+                  regs->queue_sel, value);
         vqs[regs->queue_sel].ready = value;
         break;
     case VIRTIO_MMIO_QUEUE_NOTIFY:
-        log_debug("****** zone %d %s queue notify begin ******", vdev->zone_id,
-                  virtio_device_type_to_string(vdev->type));
+        log_debug("queue notify begin: zone=%d dev=%s queue=%lu avail_idx=%u used_idx=%u last_avail=%u",
+                  vdev->zone_id, virtio_device_type_to_string(vdev->type),
+                  value, value < vdev->vqs_len && vqs[value].avail_ring ?
+                             vqs[value].avail_ring->idx : 0,
+                  value < vdev->vqs_len && vqs[value].used_ring ?
+                             vqs[value].used_ring->idx : 0,
+                  value < vdev->vqs_len ? vqs[value].last_avail_idx : 0);
 
         if (value < vdev->vqs_len) {
             log_trace("queue notify ready, handler addr is %#x",
@@ -814,26 +874,32 @@ void virtio_mmio_write(VirtIODevice *vdev, uint64_t offset, uint64_t value,
             vqs[value].notify_handler(vdev, &vqs[value]);
         }
 
-        log_debug("****** zone %d %s queue notify end ******", vdev->zone_id,
-                  virtio_device_type_to_string(vdev->type));
+        log_debug("queue notify end: zone=%d dev=%s queue=%lu avail_idx=%u used_idx=%u last_avail=%u",
+                  vdev->zone_id, virtio_device_type_to_string(vdev->type),
+                  value, value < vdev->vqs_len && vqs[value].avail_ring ?
+                             vqs[value].avail_ring->idx : 0,
+                  value < vdev->vqs_len && vqs[value].used_ring ?
+                             vqs[value].used_ring->idx : 0,
+                  value < vdev->vqs_len ? vqs[value].last_avail_idx : 0);
 
         break;
     case VIRTIO_MMIO_INTERRUPT_ACK:
         log_debug("write VIRTIO_MMIO_INTERRUPT_ACK");
 
-        if (value == regs->interrupt_status && regs->interrupt_count > 0) {
+        if (value & regs->interrupt_status && regs->interrupt_count > 0) {
             regs->interrupt_count--;
-            break;
-        } else if (value != regs->interrupt_status) {
+        } else if ((value & regs->interrupt_status) == 0) {
             log_error("interrupt_status %d is not equal to ack %d, type is %d",
                       regs->interrupt_status, value, vdev->type);
         }
-        regs->interrupt_status &= !value;
+        regs->interrupt_status &= ~value;
         log_debug("(%s) clearing! interrupt_status -> %d", __func__,
                   regs->interrupt_status);
         break;
     case VIRTIO_MMIO_STATUS:
-        log_debug("write VIRTIO_MMIO_STATUS");
+        log_debug("zone %d driver set device %s status %#lx",
+                  vdev->zone_id, virtio_device_type_to_string(vdev->type),
+                  value);
 
         regs->status = value;
         if (regs->status == 0) {
@@ -843,33 +909,57 @@ void virtio_mmio_write(VirtIODevice *vdev, uint64_t offset, uint64_t value,
     case VIRTIO_MMIO_QUEUE_DESC_LOW:
         log_debug("write VIRTIO_MMIO_QUEUE_DESC_LOW");
 
+        if (regs->queue_sel >= vdev->vqs_len) {
+            log_warn("ignore QUEUE_DESC_LOW for invalid queue %d", regs->queue_sel);
+            break;
+        }
         vqs[regs->queue_sel].desc_table_addr |= value & UINT32_MAX;
         break;
     case VIRTIO_MMIO_QUEUE_DESC_HIGH:
         log_debug("write VIRTIO_MMIO_QUEUE_DESC_HIGH");
 
+        if (regs->queue_sel >= vdev->vqs_len) {
+            log_warn("ignore QUEUE_DESC_HIGH for invalid queue %d", regs->queue_sel);
+            break;
+        }
         vqs[regs->queue_sel].desc_table_addr |= value << 32;
         virtqueue_set_desc_table(&vqs[regs->queue_sel]);
         break;
     case VIRTIO_MMIO_QUEUE_AVAIL_LOW:
         log_debug("write VIRTIO_MMIO_QUEUE_AVAIL_LOW");
 
+        if (regs->queue_sel >= vdev->vqs_len) {
+            log_warn("ignore QUEUE_AVAIL_LOW for invalid queue %d", regs->queue_sel);
+            break;
+        }
         vqs[regs->queue_sel].avail_addr |= value & UINT32_MAX;
         break;
     case VIRTIO_MMIO_QUEUE_AVAIL_HIGH:
         log_debug("write VIRTIO_MMIO_QUEUE_AVAIL_HIGH");
 
+        if (regs->queue_sel >= vdev->vqs_len) {
+            log_warn("ignore QUEUE_AVAIL_HIGH for invalid queue %d", regs->queue_sel);
+            break;
+        }
         vqs[regs->queue_sel].avail_addr |= value << 32;
         virtqueue_set_avail(&vqs[regs->queue_sel]);
         break;
     case VIRTIO_MMIO_QUEUE_USED_LOW:
         log_debug("write VIRTIO_MMIO_QUEUE_USED_LOW");
 
+        if (regs->queue_sel >= vdev->vqs_len) {
+            log_warn("ignore QUEUE_USED_LOW for invalid queue %d", regs->queue_sel);
+            break;
+        }
         vqs[regs->queue_sel].used_addr |= value & UINT32_MAX;
         break;
     case VIRTIO_MMIO_QUEUE_USED_HIGH:
         log_debug("write VIRTIO_MMIO_QUEUE_USED_HIGH");
 
+        if (regs->queue_sel >= vdev->vqs_len) {
+            log_warn("ignore QUEUE_USED_HIGH for invalid queue %d", regs->queue_sel);
+            break;
+        }
         vqs[regs->queue_sel].used_addr |= value << 32;
         virtqueue_set_used(&vqs[regs->queue_sel]);
         break;
@@ -901,20 +991,24 @@ void virtio_inject_irq(VirtQueue *vq) {
     vq->last_used_idx = idx = vq->used_ring->idx;
     // read_barrier();
     if (idx == last_used_idx) {
-        log_debug("idx equals last_used_idx");
+        log_debug("virtio irq skipped: used idx unchanged, dev=%s, vq=%d, idx=%u",
+                  virtio_device_type_to_string(vq->dev->type), vq->vq_idx, idx);
         return;
     }
     if (!vq->event_idx_enabled &&
         (vq->avail_ring->flags & VRING_AVAIL_F_NO_INTERRUPT)) {
-        log_debug("no interrupt");
-        return;
+        log_warn("virtio irq forced despite NO_INTERRUPT: dev=%s, vq=%d, used=%u, last=%u",
+                 virtio_device_type_to_string(vq->dev->type), vq->vq_idx, idx,
+                 last_used_idx);
     }
     if (vq->event_idx_enabled) {
         event_idx = VQ_USED_EVENT(vq);
-        log_debug("idx is %d, event_idx is %d, last_used_idx is %d", idx,
+        log_debug("virtio irq event_idx check: dev=%s, vq=%d, used=%u, event_idx=%u, last=%u",
+                  virtio_device_type_to_string(vq->dev->type), vq->vq_idx, idx,
                   event_idx, last_used_idx);
         if (!vring_need_event(event_idx, idx, last_used_idx)) {
-            return;
+            log_warn("virtio irq forced despite event_idx suppression: dev=%s, vq=%d",
+                     virtio_device_type_to_string(vq->dev->type), vq->vq_idx);
         }
     }
     volatile struct device_res *res;
@@ -941,8 +1035,9 @@ void virtio_inject_irq(VirtQueue *vq) {
     vq->dev->regs.interrupt_status = VIRTIO_MMIO_INT_VRING;
     vq->dev->regs.interrupt_count++;
     pthread_mutex_unlock(&RES_MUTEX);
-    log_debug("inject irq to device %s, vq is %d",
-              virtio_device_type_to_string(vq->dev->type), vq->vq_idx);
+    log_debug("inject irq to device %s, vq=%d, irq=%u, zone=%u, used_idx=%u",
+              virtio_device_type_to_string(vq->dev->type), vq->vq_idx,
+              vq->dev->irq_id, vq->dev->zone_id, idx);
     ioctl(ko_fd, HVISOR_FINISH_REQ);
 }
 
@@ -968,7 +1063,7 @@ int virtio_handle_req(volatile struct device_req *req) {
     if (i == vdevs_num) {
         log_warn("no matched virtio dev in zone %d, address is 0x%x",
                  req->src_zone, req->address);
-        value = virtio_mmio_read(NULL, 0, 0);
+        value = 0;
         virtio_finish_cfg_req(req->src_cpu, value);
         return -1;
     }
@@ -1026,7 +1121,7 @@ void virtio_close() {
                        zone_mem[i][j][MEM_SIZE]);
             }
     }
-
+    multithread_log_exit();
     log_warn("virtio daemon exit successfully");
 }
 
@@ -1151,6 +1246,65 @@ static int consume_pending_requests(void) {
  * @note The function runs indefinitely until a termination signal is received
  */
 void handle_virtio_requests(void) {
+    if (!use_eventfd) {
+        int sig;
+        sigset_t wait_set;
+        struct timespec timeout;
+        unsigned int req_front = virtio_bridge->req_front;
+        volatile struct device_req *req;
+        timeout.tv_sec = 0;
+        timeout.tv_nsec = 1000 * 1000;
+        sigemptyset(&wait_set);
+        sigaddset(&wait_set, SIGHVI);
+        sigaddset(&wait_set, SIGTERM);
+        virtio_bridge->need_wakeup = 1;
+
+        int signal_count = 0, proc_count = 0;
+        unsigned long long count = 0;
+        for (;;) {
+#ifndef LOONGARCH64
+            log_debug("signal_count is %d, proc_count is %d", signal_count,
+                      proc_count);
+            sigwait(&wait_set, &sig);
+            signal_count++;
+            if (sig == SIGTERM) {
+                virtio_close();
+                break;
+            } else if (sig != SIGHVI) {
+                log_error("unknown signal %d", sig);
+                continue;
+            }
+#endif
+            while (true) {
+                if (!is_queue_empty(req_front, virtio_bridge->req_rear)) {
+                    count = 0;
+                    proc_count++;
+                    req = &virtio_bridge->req_list[req_front];
+                    virtio_bridge->need_wakeup = 0;
+                    virtio_handle_req(req);
+                    req_front = (req_front + 1) & (MAX_REQ - 1);
+                    virtio_bridge->req_front = req_front;
+                    write_barrier();
+                }
+#ifndef LOONGARCH64
+                else {
+                    count++;
+                    if (count < 10000000)
+                        continue;
+                    count = 0;
+                    virtio_bridge->need_wakeup = 1;
+                    write_barrier();
+                    nanosleep(&timeout, NULL);
+                    if (is_queue_empty(req_front, virtio_bridge->req_rear)) {
+                        break;
+                    }
+                }
+#endif
+            }
+        }
+        return;
+    }
+
     // Block signals to handle them synchronously via signalfd
     sigset_t mask;
     sigemptyset(&mask);
@@ -1203,8 +1357,8 @@ void handle_virtio_requests(void) {
     struct epoll_event events[16];
     while (true) {
 #ifndef LOONGARCH64
-        log_info("signal_count is %d, proc_count is %d", signal_count,
-                 proc_count);
+        log_debug("signal_count is %d, proc_count is %d", signal_count,
+                  proc_count);
 
         // Wait indefinitely for a signal or a kernel kick
         int nfds = epoll_wait(epoll_fd, events, 16, -1);
@@ -1243,6 +1397,16 @@ void handle_virtio_requests(void) {
     }
 }
 
+void initialize_log() {
+    int log_level;
+#ifdef HLOG
+    log_level = HLOG;
+#else
+    log_level = LOG_WARN;
+#endif
+    log_set_level(log_level);
+}
+
 int virtio_init() {
     // The higher log level is, the faster virtio-blk will be.
     int err;
@@ -1254,6 +1418,10 @@ int virtio_init() {
 
     // Set process name
     prctl(PR_SET_NAME, "hvisor-virtio", 0, 0, 0);
+
+    // Initialize logging
+    multithread_log_init();
+    initialize_log();
 
     log_info("hvisor init");
     ko_fd = open("/dev/hvisor", O_RDWR);
@@ -1278,10 +1446,16 @@ int virtio_init() {
         exit(1);
     }
     if (ioctl(ko_fd, HVISOR_SET_EVENTFD, efd) < 0) {
-        log_error("ioctl HVISOR_SET_EVENTFD failed, errno is %d", errno);
-        close(ko_fd);
+        if (errno != EINVAL && errno != ENOTTY) {
+            log_error("ioctl HVISOR_SET_EVENTFD failed, errno is %d", errno);
+            close(ko_fd);
+            close(efd);
+            exit(1);
+        }
+        log_warn("HVISOR_SET_EVENTFD unsupported, falling back to signal mode");
         close(efd);
-        exit(1);
+        efd = -1;
+        use_eventfd = false;
     }
 
     // mmap: create shared memory

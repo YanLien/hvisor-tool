@@ -22,7 +22,6 @@ static void complete_block_operation(BlkDev *dev, struct blkp_req *req,
                                      VirtQueue *vq, int err,
                                      ssize_t written_len) {
     uint8_t *vstatus = (uint8_t *)(req->iov[req->iovcnt - 1].iov_base);
-    int is_empty = 0;
     if (err == EOPNOTSUPP)
         *vstatus = VIRTIO_BLK_S_UNSUPP;
     else if (err != 0)
@@ -33,11 +32,10 @@ static void complete_block_operation(BlkDev *dev, struct blkp_req *req,
         log_error("virt blk err, num is %d", err);
     }
     update_used_ring(vq, req->idx, written_len + 1);
-    pthread_mutex_lock(&dev->mtx);
-    is_empty = TAILQ_EMPTY(&dev->procq);
-    pthread_mutex_unlock(&dev->mtx);
-    if (is_empty)
-        virtio_inject_irq(vq);
+    log_info("virtio-blk complete: idx=%u, type=%u, offset=%llu, len=%zd, status=%u",
+             req->idx, req->type, (unsigned long long)req->offset, written_len,
+             *vstatus);
+    virtio_inject_irq(vq);
     free(req->iov);
     free(req);
 }
@@ -68,7 +66,8 @@ static void blkproc(BlkDev *dev, struct blkp_req *req, VirtQueue *vq) {
         //         printf("%x", *(int*)(iov[i].iov_base + j));
         //     printf("\n");
         // }
-        log_debug("preadv, len is %d, offset is %d", len, req->offset);
+        log_info("virtio-blk read: len=%zd, offset=%llu", len,
+                 (unsigned long long)req->offset);
         if (len < 0) {
             log_error("pread failed");
             err = errno;
@@ -76,7 +75,8 @@ static void blkproc(BlkDev *dev, struct blkp_req *req, VirtQueue *vq) {
         break;
     case VIRTIO_BLK_T_OUT:
         len = pwritev(dev->img_fd, &iov[1], n - 2, req->offset);
-        log_debug("pwritev, len is %d, offset is %d", len, req->offset);
+        log_info("virtio-blk write: len=%zd, offset=%llu", len,
+                 (unsigned long long)req->offset);
         if (len < 0) {
             log_error("pwrite failed");
             err = errno;
@@ -156,6 +156,7 @@ int virtio_blk_init(VirtIODevice *vdev, const char *img_path) {
     blk_size = st.st_size / 512; // 512 bytes per block
     dev->config.capacity = blk_size;
     dev->config.size_max = blk_size;
+    dev->config.blk_size = SECTOR_BSIZE;
     dev->img_fd = img_fd;
     vdev->virtio_close = virtio_blk_close;
     log_info("debug: virtio_blk_init: %s, size is %lld", img_path,

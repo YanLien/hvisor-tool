@@ -53,10 +53,12 @@ static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
         return;
     }
     if (dev->rx_ready <= 0) {
+        log_debug("virtio-console rx input discarded: rx queue not ready");
         read(dev->master_fd, trashbuf, sizeof(trashbuf));
         return;
     }
     if (virtqueue_is_empty(vq)) {
+        log_debug("virtio-console rx input discarded: rx virtqueue empty");
         read(dev->master_fd, trashbuf, sizeof(trashbuf));
         virtio_inject_irq(vq);
         return;
@@ -80,6 +82,7 @@ static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
             free(iov);
             break;
         }
+        log_debug("virtio-console rx forwarded %zd byte(s)", len);
         update_used_ring(vq, idx, len);
         free(iov);
     }
@@ -157,49 +160,62 @@ int virtio_console_init(VirtIODevice *vdev) {
 }
 
 int virtio_console_rxq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
-    log_debug("%s", __func__);
+    log_debug("%s: queue=%lu avail_idx=%u used_idx=%u last_avail=%u",
+              __func__, vq->vq_idx,
+              vq->avail_ring ? vq->avail_ring->idx : 0,
+              vq->used_ring ? vq->used_ring->idx : 0,
+              vq->last_avail_idx);
     ConsoleDev *dev = (ConsoleDev *)vdev->dev;
     if (dev->rx_ready <= 0) {
         dev->rx_ready = 1;
+        log_info("virtio-console rx queue ready");
         virtqueue_disable_notify(vq);
     }
     return 0;
 }
 
-static void virtq_tx_handle_one_request(ConsoleDev *dev, VirtQueue *vq) {
+static bool virtq_tx_handle_one_request(ConsoleDev *dev, VirtQueue *vq) {
     int n;
     uint16_t idx;
     ssize_t len;
     struct iovec *iov = NULL;
     if (dev->master_fd <= 0) {
         log_error("Console master fd is not ready");
-        return;
+        return false;
     }
 
     n = process_descriptor_chain(vq, &idx, &iov, NULL, 0, false);
 
     if (n < 1) {
-        return;
+        return false;
     }
 
     len = writev(dev->master_fd, iov, n);
     if (len < 0) {
         log_error("Failed to write to console, errno is %d", errno);
+        len = 0;
+    } else {
+        log_debug("virtio-console tx wrote %zd byte(s)", len);
     }
     update_used_ring(vq, idx, 0);
     free(iov);
+    return true;
 }
 
 int virtio_console_txq_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
-    log_debug("%s", __func__);
+    log_debug("%s: queue=%lu avail_idx=%u used_idx=%u last_avail=%u",
+              __func__, vq->vq_idx,
+              vq->avail_ring ? vq->avail_ring->idx : 0,
+              vq->used_ring ? vq->used_ring->idx : 0,
+              vq->last_avail_idx);
+    virtqueue_disable_notify(vq);
     while (!virtqueue_is_empty(vq)) {
-        virtqueue_disable_notify(vq);
-        while (!virtqueue_is_empty(vq)) {
-            virtq_tx_handle_one_request(vdev->dev, vq);
+        if (!virtq_tx_handle_one_request(vdev->dev, vq)) {
+            break;
         }
-        virtqueue_enable_notify(vq);
     }
-    virtio_inject_irq(vq);
+    virtqueue_enable_notify(vq);
+    vq->last_used_idx = vq->used_ring->idx;
     return 0;
 }
 

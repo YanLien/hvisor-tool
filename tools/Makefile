@@ -68,7 +68,7 @@ ifeq ($(ARCH), arm64)
 		include_dirs += -I/usr/$(triplet)/include -I/usr/$(triplet)/include/libdrm -L/usr/$(triplet)/lib -ldrm
 	endif
 else ifeq ($(ARCH), riscv)
-	CFLAGS += -static
+	CFLAGS += -DRISCV64 -static
 else ifeq ($(ARCH), loongarch)
 	CFLAGS += -DLOONGARCH64 -static
 	ifeq ($(VIRTIO_GPU), y)
